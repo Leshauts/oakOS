@@ -1,257 +1,145 @@
+# backend/presentation/api/routes/snapclient.py
 """
-Routes API spécifiques pour le plugin snapclient.
+Routes API minimalistes pour le plugin snapclient.
 """
-from fastapi import APIRouter, HTTPException, Query, Depends, Body
-from typing import Dict, Any, Optional, List
+from fastapi import APIRouter, HTTPException, Depends, Body, status as http_status
+from typing import Dict, Any
+
+# Importer la dépendance spécifique depuis le fichier dependencies.py
+# Assurez-vous que le fichier backend/presentation/api/dependencies.py existe
+# et contient la fonction get_snapclient_plugin_instance définie précédemment.
+from backend.presentation.api.dependencies import get_snapclient_plugin_instance
 
 # Créer un router dédié pour snapclient
 router = APIRouter(
     prefix="/snapclient",
-    tags=["snapclient"],
-    responses={404: {"description": "Not found"}},
+    tags=["Snapclient"], # Tag pour Swagger UI
+    responses={
+        404: {"description": "Not found"},
+        503: {"description": "Service Unavailable (Plugin not ready)"}
+    },
 )
 
-# Référence au plugin snapclient (sera injectée via l'injection de dépendances)
-snapclient_plugin_dependency = None
+# Récupérer une instance du logger depuis le plugin (via dépendance) pour logguer les erreurs API
+async def get_logger_from_plugin(plugin = Depends(get_snapclient_plugin_instance)):
+    return plugin.logger
 
-def setup_snapclient_routes(plugin_provider):
-    """
-    Configure les routes snapclient avec une référence au plugin.
-    
-    Args:
-        plugin_provider: Fonction qui retourne une instance du plugin snapclient
-    """
-    global snapclient_plugin_dependency
-    snapclient_plugin_dependency = plugin_provider
-    return router
-
-def get_snapclient_plugin():
-    """Dépendance pour obtenir le plugin snapclient"""
-    if snapclient_plugin_dependency is None:
-        raise HTTPException(
-            status_code=500, 
-            detail="Snapclient plugin not initialized. Call setup_snapclient_routes first."
-        )
-    return snapclient_plugin_dependency()
-
-@router.get("/status")
-async def get_snapclient_status(plugin = Depends(get_snapclient_plugin)):
-    """Récupère le statut actuel du client Snapcast"""
+@router.get("/status",
+            summary="Get Snapclient Status",
+            description="Retrieves the current status of the Snapclient plugin, including connection state and discovered servers.")
+async def get_snapclient_status(
+    plugin = Depends(get_snapclient_plugin_instance) # Correction: Pas de () ici
+):
+    """Récupère le statut actuel du client Snapcast."""
+    logger = await get_logger_from_plugin(plugin) # Obtenir le logger
     try:
-        # Récupérer les informations de statut
-        status = await plugin.get_status()
-        
-        # Récupérer les informations de connexion
-        connection_info = await plugin.get_connection_info()
-        
-        return {
-            "status": "ok",
-            "is_active": plugin.is_active,
-            "device_connected": connection_info.get("device_connected", False),
-            "host": connection_info.get("host"),
-            "device_name": connection_info.get("device_name"),
-            "device_info": status.get("metadata", {}),
-            "discovered_servers": status.get("discovered_servers", []),
-            "pending_requests": status.get("pending_requests", []),
-            "blacklisted_servers": status.get("blacklisted_servers", [])
-        }
+        status_data = await plugin.get_status()
+        return status_data
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Erreur lors de la récupération du statut snapclient: {str(e)}",
-            "device_connected": False
-        }
+        logger.error(f"API Error in GET /status: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get Snapclient status: {str(e)}"
+        )
 
-@router.post("/discover")
-async def discover_snapcast_servers(plugin = Depends(get_snapclient_plugin)):
-    """Force une découverte des serveurs Snapcast sur le réseau"""
+@router.post("/discover",
+             summary="Discover Snapcast Servers",
+             description="Triggers a network discovery for available Snapcast servers using Avahi/mDNS.")
+async def discover_snapcast_servers(
+    plugin = Depends(get_snapclient_plugin_instance) # Correction: Pas de () ici
+):
+    """Force une découverte des serveurs Snapcast sur le réseau."""
+    logger = await get_logger_from_plugin(plugin)
     try:
         result = await plugin.handle_command("discover", {})
-        
-        return {
-            "status": "success",
-            "servers": result.get("servers", []),
-            "count": result.get("count", 0),
-            "action": result.get("action"),
-            "message": result.get("message")
-        }
+        if result.get("success"):
+            # Retourne directement la liste des serveurs comme attendu par le frontend
+            return {"servers": result.get("servers", [])}
+        else:
+            # Si handle_command retourne une erreur spécifique
+            raise HTTPException(
+                status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=result.get("error", "Discovery failed for an unknown reason.")
+            )
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Erreur lors de la découverte des serveurs: {str(e)}"
-        }
+        logger.error(f"API Error in POST /discover: {e}", exc_info=True)
+        # Renvoyer l'exception si c'est déjà une HTTPException (levée par handle_command par ex.)
+        if isinstance(e, HTTPException): raise e
+        # Sinon, erreur serveur générique
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to discover servers: {str(e)}"
+        )
 
-@router.post("/connect/{host}")
+@router.post("/connect",
+             status_code=http_status.HTTP_200_OK, # Retourne 200 OK avec le nouveau statut
+             summary="Connect to Snapcast Server",
+             description="Connects the Snapclient plugin to the specified Snapcast server host.")
 async def connect_to_snapcast_server(
-    host: str,
-    plugin = Depends(get_snapclient_plugin)
+    payload: Dict[str, str] = Body(..., example={"host": "192.168.1.100"}),
+    plugin = Depends(get_snapclient_plugin_instance) # Correction: Pas de () ici
 ):
-    """Se connecte à un serveur Snapcast spécifique"""
+    """Se connecte à un serveur Snapcast spécifique via son hôte."""
+    logger = await get_logger_from_plugin(plugin)
+    host = payload.get("host")
+    if not host:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="'host' field is required in the request body."
+        )
     try:
         result = await plugin.handle_command("connect", {"host": host})
-        
-        if result.get("success", False):
-            return {
-                "status": "success",
-                "message": f"Connecté au serveur {host}",
-                "server": result.get("server")
-            }
+        if result.get("success"):
+            # Retourner le statut mis à jour après la connexion réussie
+            updated_status = await plugin.get_status()
+            return updated_status
         else:
-            return {
-                "status": "error",
-                "message": result.get("error", f"Impossible de se connecter au serveur {host}")
-            }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Erreur lors de la connexion au serveur: {str(e)}"
-        }
+            # Analyser l'erreur retournée par handle_command
+            error_detail = result.get("error", f"Failed to connect to host {host}.")
+            # Choisir un code d'erreur plus spécifique si possible
+            status_code = http_status.HTTP_409_CONFLICT if "Cannot connect while in state" in error_detail else http_status.HTTP_400_BAD_REQUEST
+            raise HTTPException(status_code=status_code, detail=error_detail)
 
-@router.post("/disconnect")
-async def disconnect_from_snapcast_server(plugin = Depends(get_snapclient_plugin)):
-    """Se déconnecte du serveur Snapcast actuel"""
+    except Exception as e:
+        logger.error(f"API Error in POST /connect for host {host}: {e}", exc_info=True)
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to connect to server {host}: {str(e)}"
+        )
+
+@router.post("/disconnect",
+             status_code=http_status.HTTP_200_OK, # Retourne 200 OK avec le nouveau statut
+             summary="Disconnect from Snapcast Server",
+             description="Disconnects from the currently connected Snapcast server.")
+async def disconnect_from_snapcast_server(
+    plugin = Depends(get_snapclient_plugin_instance) # Correction: Pas de () ici
+):
+    """Se déconnecte du serveur Snapcast actuel."""
+    logger = await get_logger_from_plugin(plugin)
     try:
         result = await plugin.handle_command("disconnect", {})
-        
-        if result.get("success", False):
-            return {
-                "status": "success",
-                "message": "Déconnecté du serveur"
-            }
+        # Considérer le succès si la commande réussit OU si on était déjà déconnecté
+        if result.get("success") or "Already disconnected" in result.get("message", ""):
+             # Retourner le statut mis à jour après la déconnexion réussie (ou si déjà déconnecté)
+            updated_status = await plugin.get_status()
+            return updated_status
         else:
-            return {
-                "status": "error",
-                "message": result.get("error", "Impossible de se déconnecter du serveur")
-            }
+            # Si handle_command échoue explicitement
+             raise HTTPException(
+                 status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, # Ou 400 si l'erreur vient du plugin
+                 detail=result.get("error", "Failed to disconnect.")
+             )
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Erreur lors de la déconnexion du serveur: {str(e)}"
-        }
+        logger.error(f"API Error in POST /disconnect: {e}", exc_info=True)
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to disconnect from server: {str(e)}"
+        )
 
-@router.post("/accept-request")
-async def accept_connection_request(
-    data: Dict[str, Any] = Body(...),
-    plugin = Depends(get_snapclient_plugin)
-):
-    """Accepte une demande de connexion entrante"""
-    try:
-        # Récupérer l'ID de demande ou l'hôte
-        request_id = data.get("request_id")
-        host = data.get("host")
-        
-        if not request_id and not host:
-            return {
-                "status": "error",
-                "message": "Veuillez fournir un request_id ou un host"
-            }
-        
-        command_data = {}
-        if request_id:
-            command_data["request_id"] = request_id
-        if host:
-            command_data["host"] = host
-        
-        result = await plugin.handle_command("accept_connection", command_data)
-        
-        if result.get("success", False):
-            return {
-                "status": "success",
-                "message": result.get("message", "Demande de connexion acceptée"),
-                "server": result.get("server")
-            }
-        else:
-            return {
-                "status": "error",
-                "message": result.get("error", "Impossible d'accepter la demande de connexion")
-            }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Erreur lors de l'acceptation de la demande: {str(e)}"
-        }
-
-@router.post("/reject-request")
-async def reject_connection_request(
-    data: Dict[str, Any] = Body(...),
-    plugin = Depends(get_snapclient_plugin)
-):
-    """Rejette une demande de connexion entrante"""
-    try:
-        # Récupérer l'ID de demande ou l'hôte
-        request_id = data.get("request_id")
-        host = data.get("host")
-        
-        if not request_id and not host:
-            return {
-                "status": "error",
-                "message": "Veuillez fournir un request_id ou un host"
-            }
-        
-        command_data = {}
-        if request_id:
-            command_data["request_id"] = request_id
-        if host:
-            command_data["host"] = host
-        
-        result = await plugin.handle_command("reject_connection", command_data)
-        
-        if result.get("success", False):
-            return {
-                "status": "success",
-                "message": result.get("message", "Demande de connexion rejetée")
-            }
-        else:
-            return {
-                "status": "error",
-                "message": result.get("error", "Impossible de rejeter la demande de connexion")
-            }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Erreur lors du rejet de la demande: {str(e)}"
-        }
-
-@router.post("/restart")
-async def restart_snapclient(plugin = Depends(get_snapclient_plugin)):
-    """Redémarre le processus snapclient"""
-    try:
-        result = await plugin.handle_command("restart", {})
-        
-        if result.get("success", False):
-            return {
-                "status": "success",
-                "message": result.get("message", "Processus snapclient redémarré")
-            }
-        else:
-            return {
-                "status": "error",
-                "message": result.get("error", "Impossible de redémarrer le processus snapclient")
-            }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Erreur lors du redémarrage du processus: {str(e)}"
-        }
-
-@router.post("/test-audio")
-async def test_audio(plugin = Depends(get_snapclient_plugin)):
-    """Exécute un test audio pour vérifier que le son fonctionne"""
-    try:
-        result = await plugin.handle_command("test_audio", {})
-        
-        if result.get("success", False):
-            return {
-                "status": "success",
-                "message": "Test audio lancé avec succès"
-            }
-        else:
-            return {
-                "status": "error",
-                "message": result.get("error", "Impossible de lancer le test audio")
-            }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Erreur lors du test audio: {str(e)}"
-        }
+# Notes finales :
+# - Ce fichier dépend de `backend/presentation/api/dependencies.py` pour la fonction `get_snapclient_plugin_instance`.
+# - Il utilise l'instance du plugin injectée pour appeler `handle_command` et `get_status`.
+# - Les réponses d'erreur sont gérées via `HTTPException`.
+# - Les réponses de succès pour connect/disconnect retournent le nouveau statut complet.

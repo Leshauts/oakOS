@@ -1,253 +1,178 @@
 <template>
   <div class="snapclient-display">
-    <!-- État de chargement initial uniquement -->
-    <div v-if="initialLoading" class="loading-state">
+    <!-- État de chargement initial (uniquement si la source est active) -->
+    <div v-if="audioStore.currentState === 'snapclient' && initialLoading" class="loading-state">
       <div class="loading-spinner"></div>
-      <p>Chargement de l'état Snapclient...</p>
+      <p>Chargement Snapclient...</p>
     </div>
-    
-    <!-- Erreur websocket -->
-    <div v-else-if="!wsConnected" class="error-state">
-      <h3>Connexion au serveur perdue</h3>
-      <p>La connexion WebSocket au serveur oakOS est interrompue. Vérifiez que le serveur backend est en cours d'exécution.</p>
-      <button @click="refreshStatus" class="retry-button">Réessayer</button>
+
+    <!-- État d'erreur persistant -->
+    <div v-else-if="snapclientStore.error" class="error-state">
+      <h3>Erreur Snapclient</h3>
+      <p>{{ snapclientStore.error }}</p>
+      <button @click="retryFetchStatus" class="retry-button" :disabled="snapclientStore.isLoading">
+        Réessayer
+      </button>
     </div>
-    
-    <!-- Erreur état -->
-    <div v-else-if="errorState" class="error-state">
-      <h3>Erreur lors du chargement de Snapclient</h3>
-      <p>{{ snapclientStore.error || 'Une erreur s\'est produite. Veuillez réessayer.' }}</p>
-      <button @click="refreshStatus" class="retry-button">Réessayer</button>
-    </div>
-    
-    <!-- États normaux -->
-    <template v-else>
-      <SnapclientConnectionInfo v-if="isConnected" />
-      <SnapclientWaitingConnection v-else />
+
+    <!-- États normaux (seulement si la source est active) -->
+    <template v-else-if="audioStore.currentState === 'snapclient' && snapclientStore.isActive">
+      <!-- Afficher l'état connecté -->
+      <SnapclientConnectionInfo v-if="snapclientStore.showConnectedState" />
+      <!-- Afficher l'état en attente -->
+      <SnapclientWaitingConnection v-else-if="snapclientStore.showWaitingState" />
+       <!-- Fallback si aucun état ne correspond (ne devrait pas arriver) -->
+      <div v-else class="info-state">
+        <p>État Snapclient indéterminé ({{ snapclientStore.pluginState }}).</p>
+         <button @click="retryFetchStatus" class="retry-button" :disabled="snapclientStore.isLoading">
+            Rafraîchir
+        </button>
+      </div>
     </template>
+
+     <!-- Message si la source n'est pas active -->
+    <div v-else class="info-state">
+        <p>Sélectionnez la source "MacOS (Snapcast)" pour l'activer.</p>
+    </div>
+
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, watch, ref } from 'vue';
+import { ref, onMounted, onUnmounted, watch } from 'vue';
 import { useAudioStore } from '@/stores/index';
 import { useSnapclientStore } from '@/stores/snapclient';
 import SnapclientWaitingConnection from './SnapclientWaitingConnection.vue';
 import SnapclientConnectionInfo from './SnapclientConnectionInfo.vue';
-import useWebSocket from '@/services/websocket';
+import useWebSocket from '@/services/websocket'; // Pour écouter les mises à jour
 
-const { on, isConnected: wsConnected } = useWebSocket();
+// Stores
 const audioStore = useAudioStore();
 const snapclientStore = useSnapclientStore();
 
-// États locaux
-const initialLoading = ref(true);
-const errorState = ref(false);
-let connectionCheckInterval = null;
-let lastStatusCheckTime = ref(0);
+// Service WebSocket
+const { on } = useWebSocket();
 
-// Références pour les fonctions de désabonnement - DÉFINIR ICI
-const unsubscribeMonitorConnected = ref(null);
-const unsubscribeMonitorDisconnected = ref(null);
-const unsubscribeServerEvent = ref(null);
-const unsubscribeAudioStatus = ref(null);
-const unsubscribeServerDisappeared = ref(null);
+// État local
+const initialLoading = ref(false);
+let unsubscribeAudioStatus = null;
 
-// État dérivé pour contrôler l'affichage
-const isConnected = computed(() => {
-  return snapclientStore.isConnected && snapclientStore.pluginState === 'connected';
-});
+// --- Fonctions ---
 
-// Fonction pour rafraîchir le statut
-async function refreshStatus(showLoader = false) {
-  if (showLoader) {
-    initialLoading.value = true;
-  }
-  
-  errorState.value = false;
-  lastStatusCheckTime.value = Date.now();
-  
-  try {
-    await snapclientStore.fetchStatus(true);
-    console.log("✅ Statut rafraîchi avec succès");
-  } catch (err) {
-    console.error("❌ Erreur lors du rafraîchissement du statut:", err);
-    errorState.value = true;
-  } finally {
-    initialLoading.value = false;
-  }
+async function initializeSource() {
+    if (audioStore.currentState === 'snapclient') {
+        console.log("SnapclientDisplay: Initialisation car la source MacOS est active.");
+        initialLoading.value = true;
+        snapclientStore.error = null; // Reset error on init
+        try {
+            await snapclientStore.fetchStatus(false); // Ne pas montrer le loader global ici
+        } catch (err) {
+            console.error("SnapclientDisplay: Erreur lors de l'initialisation", err);
+            // L'erreur est déjà dans snapclientStore.error
+        } finally {
+            initialLoading.value = false;
+        }
+    } else {
+         // Si la source n'est pas active, s'assurer que le store est reset
+         // snapclientStore.reset(); // Déplacé dans le watcher audioStore.currentState
+         console.log("SnapclientDisplay: Initialisation ignorée, source non active.");
+    }
 }
 
-// Vérifie l'état de la connexion périodiquement
-function startConnectionCheck() {
-  // Nettoyer l'intervalle existant s'il y en a un
-  if (connectionCheckInterval) {
-    clearInterval(connectionCheckInterval);
-  }
-  
-  // Vérifier la connexion périodiquement
-  connectionCheckInterval = setInterval(async () => {
-    // Ne vérifier que si nous sommes censés être connectés
-    if (isConnected.value && audioStore.currentState === 'macos') {
-      console.log("🔍 Vérification périodique de la connexion Snapclient");
-      
-      try {
-        // Éviter les vérifications trop fréquentes
-        if (Date.now() - lastStatusCheckTime.value < 2000) {
-          return;
-        }
-        
-        lastStatusCheckTime.value = Date.now();
-        const status = await snapclientStore.fetchStatus(false);
-        
-        // Si déconnecté, mettre à jour l'interface
-        if (!status.device_connected && snapclientStore.isConnected) {
-          console.log("🔴 Déconnexion détectée lors de la vérification périodique");
-          snapclientStore.forceDisconnect("periodic_check");
-        }
-      } catch (err) {
-        console.error("🔴 Erreur lors de la vérification périodique", err);
-        // En cas d'erreur, forcer la déconnexion pour mettre à jour l'UI
-        snapclientStore.forceDisconnect("check_error");
-      }
-    }
-  }, 3000); // Vérifier toutes les 3 secondes
+async function retryFetchStatus() {
+    console.log("SnapclientDisplay: Tentative de rechargement du statut...");
+    initialLoading.value = true; // Montrer le loader local
+    await initializeSource(); // Réutilise la logique d'initialisation
 }
 
-// Surveiller l'état de connexion pour mettre à jour l'UI
-watch(isConnected, (connected) => {
-  console.log(`⚡ État de connexion Snapclient changé: ${connected}`);
-  
-  // Mettre à jour l'UI immédiatement selon l'état de connexion
-  if (!connected && snapclientStore.pluginState !== 'connected') {
-    // Force l'actualisation si on passe de connecté à déconnecté
-    console.log("🔁 Forcer l'actualisation de l'UI après déconnexion");
-  }
-});
+// --- Watchers ---
 
-// Surveillance des changements d'état audio
-watch(() => audioStore.currentState, async (newState, oldState) => {
-  if (newState === 'macos' && oldState !== 'macos') {
-    // Activation de la source MacOS
-    console.log("🔄 Source MacOS activée - Chargement initial de l'état");
-    initialLoading.value = true;
-    try {
-      await snapclientStore.fetchStatus(true);
-      // Démarrer la vérification périodique quand on active MacOS
-      startConnectionCheck();
-    } catch (err) {
-      console.error("❌ Erreur lors du chargement initial:", err);
-      errorState.value = true;
-    } finally {
-      initialLoading.value = false;
+// Surveiller le changement de source audio
+watch(() => audioStore.currentState, (newState, oldState) => {
+    console.log(`SnapclientDisplay: Changement de source audio de ${oldState} vers ${newState}`);
+    if (newState === 'snapclient') {
+        // Initialiser quand on active la source
+        initializeSource();
+    } else if (oldState === 'snapclient') {
+        // Nettoyer quand on quitte la source
+        console.log("SnapclientDisplay: Nettoyage de l'état Snapclient car source désactivée.");
+        snapclientStore.reset(); // Réinitialiser le store Snapclient
     }
-  } else if (oldState === 'macos' && newState !== 'macos') {
-    // Désactivation de la source MacOS
-    if (connectionCheckInterval) {
-      clearInterval(connectionCheckInterval);
-      connectionCheckInterval = null;
-    }
-    snapclientStore.reset();
-  }
-});
+}, { immediate: false }); // Ne pas lancer à la création, on le fait dans onMounted
 
-onMounted(async () => {
-  // Chargement initial
-  console.log("🔄 Chargement initial du statut Snapclient");
-  initialLoading.value = true;
-  try {
-    await snapclientStore.fetchStatus(true);
-    errorState.value = false;
-    
-    // Démarrer la vérification périodique si on est sur MacOS
-    if (audioStore.currentState === 'macos') {
-      startConnectionCheck();
-    }
-  } catch (err) {
-    console.error("❌ Erreur lors du chargement initial:", err);
-    errorState.value = true;
-  } finally {
-    initialLoading.value = false;
-  }
+// --- Cycle de vie ---
 
-  // S'abonner aux événements
-  unsubscribeMonitorConnected.value = on('snapclient_monitor_connected', (data) => {
-    console.log("⚡ Moniteur connecté au serveur:", data.host);
-    snapclientStore.updateFromWebSocketEvent('snapclient_monitor_connected', data);
-  });
+onMounted(() => {
+    console.log("SnapclientDisplay: Composant monté.");
+    // Initialisation si la source est déjà active au montage
+    initializeSource();
 
-  unsubscribeMonitorDisconnected.value = on('snapclient_monitor_disconnected', (data) => {
-    console.log("⚡ Moniteur déconnecté du serveur:", data.host, data.reason);
-    snapclientStore.updateFromWebSocketEvent('snapclient_monitor_disconnected', data);
-    
-    // Forcer un refresh après un court délai
-    setTimeout(() => refreshStatus(false), 200);
-  });
-  
-  // Événements serveur
-  unsubscribeServerEvent.value = on('snapclient_server_event', (data) => {
-    console.log("⚡ Événement serveur reçu:", data);
-  });
-  
-  // Disparition du serveur
-  unsubscribeServerDisappeared.value = on('snapclient_server_disappeared', (data) => {
-    console.log("🚨 Serveur Snapcast disparu:", data);
-    snapclientStore.updateFromWebSocketEvent('snapclient_server_disappeared', data);
-    
-    // Forcer un refresh après un court délai
-    setTimeout(() => refreshStatus(false), 200);
-  });
-  
-  // Mises à jour d'état audio
-  unsubscribeAudioStatus.value = on('audio_status_updated', (data) => {
-    if (data.source === 'snapclient') {
-      console.log("⚡ État audio mis à jour:", data.plugin_state);
-      snapclientStore.updateFromStateEvent(data);
-    }
-  });
+    // S'abonner aux mises à jour d'état globales via WebSocket
+    unsubscribeAudioStatus = on('audio_status_updated', (data) => {
+        if (data.source === 'snapclient') {
+            console.log("SnapclientDisplay: Mise à jour reçue via WebSocket", data.plugin_state);
+            // Utiliser l'action du store pour mettre à jour l'état
+            snapclientStore._updateState(data);
+        }
+    });
 });
 
 onUnmounted(() => {
-  // Nettoyer l'intervalle de vérification périodique
-  if (connectionCheckInterval) {
-    clearInterval(connectionCheckInterval);
-    connectionCheckInterval = null;
-  }
-  
-  // Désinscription des événements
-  if (unsubscribeMonitorConnected.value) unsubscribeMonitorConnected.value();
-  if (unsubscribeMonitorDisconnected.value) unsubscribeMonitorDisconnected.value();
-  if (unsubscribeServerEvent.value) unsubscribeServerEvent.value();
-  if (unsubscribeAudioStatus.value) unsubscribeAudioStatus.value();
-  if (unsubscribeServerDisappeared.value) unsubscribeServerDisappeared.value();
+    console.log("SnapclientDisplay: Composant démonté.");
+    // Se désabonner des événements WebSocket
+    if (unsubscribeAudioStatus) {
+        unsubscribeAudioStatus();
+        unsubscribeAudioStatus = null;
+        console.log("SnapclientDisplay: Désabonné de 'audio_status_updated'.");
+    }
+     // Optionnel: reset le store si on quitte complètement la vue ?
+     // Non, le watcher sur currentState s'en occupe mieux.
 });
+
 </script>
 
 <style scoped>
 .snapclient-display {
   width: 100%;
-  padding: 1rem;
+  padding: 1rem 0; /* Moins de padding latéral par défaut */
   display: flex;
   flex-direction: column;
   align-items: center;
 }
 
-.loading-state, .error-state {
+.loading-state, .error-state, .info-state {
   text-align: center;
-  padding: 2rem;
-  width: 100%;
+  padding: 1rem; /* Réduit le padding */
+  margin: 1rem auto;
   max-width: 500px;
-  margin: 0 auto;
+  width: 90%; /* Utiliser un pourcentage pour la largeur */
+  border-radius: 8px; /* Bords arrondis */
+}
+
+.loading-state {
+    color: #555;
 }
 
 .loading-spinner {
-  width: 40px;
-  height: 40px;
-  margin: 0 auto 1rem;
-  border: 4px solid rgba(0, 0, 0, 0.1);
+  width: 30px; /* Réduit la taille */
+  height: 30px;
+  margin: 0 auto 0.8rem; /* Réduit la marge */
+  border: 3px solid rgba(0, 0, 0, 0.1);
   border-radius: 50%;
-  border-top: 4px solid #3498db;
+  border-top-color: #3498db; /* Garder la couleur */
   animation: spin 1s linear infinite;
+}
+
+.error-state {
+  background-color: #ffebee;
+  border: 1px solid #e57373; /* Couleur de bordure plus douce */
+  color: #c62828; /* Texte d'erreur plus foncé */
+}
+
+.info-state {
+    background-color: #e3f2fd;
+    border: 1px solid #90caf9;
+    color: #1e88e5;
 }
 
 .retry-button {
@@ -257,21 +182,23 @@ onUnmounted(() => {
   border-radius: 4px;
   padding: 8px 16px;
   cursor: pointer;
-  margin-top: 1rem;
+  margin-top: 0.8rem; /* Réduit la marge */
+  transition: background-color 0.2s, box-shadow 0.2s;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
-.retry-button:hover {
-  background-color: #0b7dda;
+.retry-button:hover:not(:disabled) {
+  background-color: #1976D2;
+   box-shadow: 0 4px 8px rgba(0,0,0,0.15);
 }
 
-.error-state {
-  background-color: #ffebee;
-  border: 1px solid #ffcdd2;
-  border-radius: 4px;
+.retry-button:disabled {
+  background-color: #90a4ae; /* Couleur désactivée plus claire */
+  cursor: not-allowed;
+   box-shadow: none;
 }
 
 @keyframes spin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
+  to { transform: rotate(360deg); }
 }
 </style>

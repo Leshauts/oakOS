@@ -1,485 +1,258 @@
 // frontend/src/stores/snapclient.js
-
 /**
- * Store Pinia pour la gestion de l'état de Snapclient - Version corrigée
+ * Store Pinia minimaliste pour la gestion de l'état de Snapclient.
+ * Réagit uniquement à l'état fourni par le backend via /status et l'événement
+ * WebSocket 'audio_status_updated'.
  */
 import { defineStore } from 'pinia';
-import { ref, computed, watch } from 'vue';
+import { ref, computed } from 'vue';
 import axios from 'axios';
+import { useAudioStore } from '@/stores/index'; // Pour vérifier si la source est active
 
 export const useSnapclientStore = defineStore('snapclient', () => {
-  // État interne
-  const isActive = ref(false);
-  const isConnected = ref(false);
-  const deviceName = ref(null);
-  const host = ref(null);
-  const pluginState = ref('inactive');
-  const discoveredServers = ref([]);
-  const error = ref(null);
-  const lastAction = ref(null);
-  const isLoading = ref(false);
-  const blacklistedServers = ref([]);
-  const lastStatusCheck = ref(0);
-  const connectionLastChanged = ref(Date.now());
-  const forceNextRefresh = ref(false);
+    // Référence au store audio principal
+    const audioStore = useAudioStore();
 
-  // Getters
-  const hasServers = computed(() => discoveredServers.value.length > 0);
-  const currentServer = computed(() => {
-    if (!isConnected.value) return null;
-    return {
-      name: deviceName.value,
-      host: host.value
-    };
-  });
+    // --- État Réactif ---
+    const pluginState = ref('inactive'); // 'inactive', 'ready_to_connect', 'connected'
+    const isActive = ref(false);      // Le plugin est-il sélectionné comme source audio ?
+    const isConnected = ref(false);   // Le client est-il connecté à un serveur ?
+    const host = ref(null);           // Hôte du serveur connecté
+    const deviceName = ref(null);     // Nom du serveur connecté
+    const discoveredServers = ref([]); // Liste des serveurs découverts [{ host, name, port }]
+    const processRunning = ref(false); // Le processus snapclient tourne-t-il ? (info indicative)
+    const isLoading = ref(false);     // Indicateur pour les appels API
+    const error = ref(null);          // Stockage des erreurs API ou de logique
 
-  /**
-   * Met à jour l'état du store depuis un événement d'état
-   */
-  function updateFromStateEvent(data) {
-    console.log("🔄 Mise à jour depuis événement d'état:", data.plugin_state);
-
-    // Vérifier que les données viennent bien de snapclient
-    if (data.source !== 'snapclient') return false;
-
-    // Mise à jour de l'état
-    pluginState.value = data.plugin_state;
-
-    if (data.plugin_state === 'connected' && data.connected === true) {
-      // Vérifier s'il y a un changement d'état
-      const wasConnected = isConnected.value;
-      isConnected.value = true;
-      deviceName.value = data.device_name || 'Serveur inconnu';
-      host.value = data.host;
-      error.value = null;
-
-      // Enregistrer le timestamp de changement
-      if (!wasConnected) {
-        connectionLastChanged.value = Date.now();
-        
-        // Notifier du changement d'état
-        window.dispatchEvent(new CustomEvent('snapclient-connection-changed', {
-          detail: { connected: true }
-        }));
-      }
-
-      console.log("✅ État mis à jour: connecté à", deviceName.value);
-    }
-    else if (data.plugin_state === 'ready_to_connect') {
-      // Vérifier s'il y a un changement d'état réel
-      if (isConnected.value) {
-        isConnected.value = false;
-        deviceName.value = null;
-        host.value = null;
-        connectionLastChanged.value = Date.now();
-
-        // Notifier du changement d'état
-        window.dispatchEvent(new CustomEvent('snapclient-connection-changed', {
-          detail: { connected: false }
-        }));
-      }
-      console.log("✅ État mis à jour: prêt à connecter");
-    }
-
-    return true;
-  }
-
-  /**
-   * Met à jour l'état du store depuis un événement WebSocket
-   */
-  function updateFromWebSocketEvent(eventType, data) {
-    console.log(`⚡ Mise à jour depuis événement WebSocket: ${eventType}`, data);
-
-    // Gérer les événements de déconnexion - priorité maximale
-    if (eventType === 'snapclient_monitor_disconnected' || eventType === 'snapclient_server_disappeared') {
-      console.log("🔴 Déconnexion détectée via WebSocket:", data.host);
-
-      // Marquer forcément comme déconnecté
-      if (isConnected.value) {
-        // Éviter les rebonds trop rapides (dans les 2 secondes après une connexion)
-        const timeSinceLastChange = Date.now() - connectionLastChanged.value;
-        if (timeSinceLastChange < 2000) {
-          console.log(`⚠️ Déconnexion ignorée car trop récente après connexion (${timeSinceLastChange}ms)`);
-          // Forcer une vérification d'état pour confirmer
-          setTimeout(() => {
-            forceNextRefresh.value = true;
-            fetchStatus(true);
-          }, 1000);
-          return true;
+    // --- Getters Calculés ---
+    const currentServer = computed(() => {
+        if (isConnected.value && host.value) {
+            return { name: deviceName.value, host: host.value };
         }
-          
-        console.log("🔄 Changement d'état: connecté -> déconnecté");
-        isConnected.value = false;
-        deviceName.value = null;
-        host.value = null;
-        pluginState.value = 'ready_to_connect';
-        connectionLastChanged.value = Date.now();
-        
-        // Définir un message d'erreur informatif
-        error.value = `Le serveur ${data.host} s'est déconnecté (${data.reason || 'raison inconnue'})`;
+        return null;
+    });
 
-        // Notifier du changement d'état avec force: true
-        window.dispatchEvent(new CustomEvent('snapclient-connection-changed', {
-          detail: { connected: false, source: eventType, force: true }
-        }));
-        
-        // Forcer un rafraîchissement complet
-        setTimeout(() => {
-          forceNextRefresh.value = true;
-          fetchStatus(true);
-        }, 500);
-      }
+    // Indique si l'UI doit afficher l'état "connecté"
+    const showConnectedState = computed(() => isActive.value && isConnected.value && pluginState.value === 'connected');
+     // Indique si l'UI doit afficher l'état "en attente"
+    const showWaitingState = computed(() => isActive.value && !isConnected.value && pluginState.value === 'ready_to_connect');
 
-      return true;
+    // --- Actions ---
+
+    /**
+     * Met à jour l'état interne depuis les données reçues (API status ou WS event).
+     * C'est la fonction centrale de mise à jour.
+     * @param {object} statusData - Les données d'état reçues du backend.
+     */
+    function _updateState(statusData) {
+        if (!statusData || statusData.source !== 'snapclient') {
+            console.warn("Snapclient store: Données invalides reçues pour _updateState", statusData);
+            return;
+        }
+
+        try {
+            pluginState.value = statusData.plugin_state ?? 'inactive';
+            isActive.value = statusData.is_active ?? false;
+            isConnected.value = statusData.connected ?? false; // Utiliser 'connected' du backend
+            host.value = statusData.host ?? null;
+            deviceName.value = statusData.device_name ?? null;
+            // S'assurer que la liste est toujours un tableau
+            discoveredServers.value = Array.isArray(statusData.discovered_servers) ? statusData.discovered_servers : [];
+            processRunning.value = statusData.process_running ?? false;
+
+            // Effacer l'erreur si la mise à jour réussit
+            error.value = null;
+
+            // Log de l'état mis à jour (optionnel, utile pour debug)
+            // console.debug('Snapclient store state updated:', {
+            //     pluginState: pluginState.value,
+            //     isActive: isActive.value,
+            //     isConnected: isConnected.value,
+            //     host: host.value,
+            //     deviceName: deviceName.value,
+            //     servers: discoveredServers.value.length,
+            // });
+
+        } catch (e) {
+             console.error("Snapclient store: Erreur lors de la mise à jour de l'état:", e, "Data:", statusData);
+             error.value = "Erreur interne lors de la mise à jour de l'état Snapclient.";
+        }
     }
 
-    // Gérer les événements de connexion
-    if (eventType === 'snapclient_monitor_connected') {
-      console.log(`⚡ Moniteur connecté à ${data.host}`);
-      error.value = null;
-
-      // Si on est connecté au même serveur, mettre à jour l'état
-      if (host.value === data.host) {
-        isConnected.value = true;
-        pluginState.value = 'connected';
-        connectionLastChanged.value = Date.now();
-      }
-
-      return true;
+    /**
+     * Récupère le statut actuel depuis l'API /status.
+     * Utilise _updateState pour mettre à jour l'état interne.
+     * @param {boolean} showLoading - Afficher l'indicateur de chargement global ?
+     */
+    async function fetchStatus(showLoading = true) {
+        if (showLoading) isLoading.value = true;
+        error.value = null; // Reset error before fetch
+        try {
+            console.debug("Snapclient store: Appel fetchStatus");
+            const response = await axios.get('/api/snapclient/status');
+            _updateState(response.data); // Mettre à jour l'état avec la réponse
+            return response.data;
+        } catch (err) {
+            console.error('Snapclient store: Erreur fetchStatus:', err);
+            error.value = err.response?.data?.detail || err.message || 'Erreur de communication avec le serveur.';
+            // En cas d'erreur sévère, on pourrait réinitialiser certains états ?
+            // Exemple : si erreur 500, on n'est probablement pas connecté
+             if (err.response?.status >= 500) {
+                 _updateState({ // Forcer un état de base
+                     source: 'snapclient',
+                     plugin_state: 'inactive', // Ou ready_to_connect si on sait que le plugin est actif
+                     is_active: audioStore.currentState === 'snapclient', // Utiliser le store audio comme référence
+                     connected: false,
+                     host: null,
+                     device_name: null,
+                     discovered_servers: [],
+                     process_running: false,
+                 });
+             }
+            throw err; // Renvoyer l'erreur pour que l'appelant puisse réagir
+        } finally {
+            if (showLoading) isLoading.value = false;
+        }
     }
 
-    return false;
-  }
+    /**
+     * Déclenche une découverte des serveurs via l'API.
+     * Met à jour discoveredServers via _updateState si l'API retourne le statut.
+     * (Actuellement, l'API discover retourne juste la liste, donc mise à jour manuelle)
+     */
+    async function discoverServers() {
+        isLoading.value = true;
+        error.value = null;
+        try {
+            console.debug("Snapclient store: Appel discoverServers");
+            const response = await axios.post('/api/snapclient/discover');
+            // L'API /discover retourne maintenant { servers: [...] }
+            if (Array.isArray(response.data.servers)) {
+                 discoveredServers.value = response.data.servers;
+                 console.info(`Snapclient store: Découverte terminée, ${discoveredServers.value.length} serveurs trouvés.`);
+            } else {
+                 console.warn("Snapclient store: Réponse inattendue de /discover", response.data);
+                 discoveredServers.value = [];
+            }
+             // Optionnel: rafraîchir l'état complet après la découverte
+             // await fetchStatus(false);
+            return discoveredServers.value; // Retourner la liste directement
+        } catch (err) {
+            console.error('Snapclient store: Erreur discoverServers:', err);
+            error.value = err.response?.data?.detail || err.message || 'Erreur lors de la découverte des serveurs.';
+            discoveredServers.value = []; // Vider la liste en cas d'erreur
+            throw err;
+        } finally {
+            isLoading.value = false;
+        }
+    }
 
-  /**
-   * Force la déconnexion sans appel API
-   */
-  function forceDisconnect(reason = 'manual') {
-    console.log(`🔌 Forçage de la déconnexion (raison: ${reason})`);
+    /**
+     * Se connecte à un serveur Snapcast via l'API.
+     * Met à jour l'état complet via _updateState basé sur la réponse de l'API.
+     * @param {string} serverHost - L'hôte du serveur auquel se connecter.
+     */
+    async function connectToServer(serverHost) {
+        // Vérifier si on est déjà connecté à ce serveur pour éviter appel inutile
+        if (isConnected.value && host.value === serverHost) {
+             console.log(`Snapclient store: Déjà connecté à ${serverHost}.`);
+             return { success: true, message: "Already connected." };
+        }
 
-    // Mise à jour forcée de l'état
-    isConnected.value = false;
-    deviceName.value = null;
-    host.value = null;
-    pluginState.value = 'ready_to_connect';
-    connectionLastChanged.value = Date.now();
+        isLoading.value = true;
+        error.value = null;
+        try {
+            console.info(`Snapclient store: Tentative de connexion à ${serverHost}`);
+            const response = await axios.post('/api/snapclient/connect', { host: serverHost });
+            // L'API connect retourne le nouveau statut complet en cas de succès
+            _updateState(response.data);
+            console.info(`Snapclient store: Connecté avec succès à ${deviceName.value} (${host.value})`);
+            return response.data;
+        } catch (err) {
+            console.error(`Snapclient store: Erreur connexion à ${serverHost}:`, err);
+            error.value = err.response?.data?.detail || err.message || `Erreur de connexion à ${serverHost}.`;
+             // Si la connexion échoue, rafraîchir l'état pour être sûr
+             await fetchStatus(false);
+            throw err;
+        } finally {
+            isLoading.value = false;
+        }
+    }
 
-    // Forcer un rendu immédiat
-    setTimeout(() => {
-      // Envoyer une notification DOM explicite
-      document.dispatchEvent(new CustomEvent('snapclient-disconnected', {
-        detail: { timestamp: Date.now(), reason }
-      }));
+    /**
+     * Se déconnecte du serveur actuel via l'API.
+     * Met à jour l'état complet via _updateState basé sur la réponse de l'API.
+     */
+    async function disconnectFromServer() {
+        // Vérifier si on est déjà déconnecté
+         if (!isConnected.value) {
+             console.log("Snapclient store: Déjà déconnecté.");
+             return { success: true, message: "Already disconnected." };
+         }
 
-      // Événement Vue standard
-      window.dispatchEvent(new CustomEvent('snapclient-connection-changed', {
-        detail: { connected: false, source: 'force_disconnect', reason }
-      }));
-      
-      // Forcer une vérification d'état
-      setTimeout(() => {
-        forceNextRefresh.value = true;
-        fetchStatus(true);
-      }, 500);
-    }, 0);
+        isLoading.value = true;
+        error.value = null;
+        const serverNameToLog = deviceName.value || host.value; // Pour le log
+        try {
+            console.info(`Snapclient store: Tentative de déconnexion de ${serverNameToLog}`);
+            const response = await axios.post('/api/snapclient/disconnect');
+            // L'API disconnect retourne le nouveau statut complet en cas de succès
+            _updateState(response.data);
+            console.info(`Snapclient store: Déconnecté avec succès de ${serverNameToLog}`);
+            return response.data;
+        } catch (err) {
+            console.error(`Snapclient store: Erreur déconnexion de ${serverNameToLog}:`, err);
+            error.value = err.response?.data?.detail || err.message || 'Erreur lors de la déconnexion.';
+            // Même si l'API échoue, forcer un état déconnecté dans l'UI peut être une bonne idée
+            // ou au moins rafraîchir pour obtenir l'état réel du backend.
+            await fetchStatus(false);
+            throw err;
+        } finally {
+            isLoading.value = false;
+        }
+    }
 
-    return { success: true, forced: true };
-  }
-
-  /**
-   * Récupère le statut actuel du plugin Snapclient
-   */
-  async function fetchStatus(force = false) {
-    try {
-      // Éviter les requêtes trop fréquentes
-      const now = Date.now();
-      if (!force && !forceNextRefresh.value && isLoading.value && now - lastStatusCheck.value < 2000) {
-        console.log("🔄 Requête fetchStatus ignorée (déjà en cours ou trop récente)");
-        return { cached: true };
-      }
-
-      lastStatusCheck.value = now;
-      isLoading.value = true;
-      error.value = null;
-      
-      // Réinitialiser le flag de forçage
-      forceNextRefresh.value = false;
-
-      const response = await axios.get('/api/snapclient/status');
-      const data = response.data;
-
-      if (data.status === 'error') {
-        throw new Error(data.message);
-      }
-
-      console.log("📊 Statut Snapclient reçu:", {
-        is_active: data.is_active,
-        device_connected: data.device_connected,
-        servers: data.discovered_servers?.length || 0
-      });
-
-      // Mise à jour de l'état
-      isActive.value = data.is_active === true;
-
-      // Vérifier s'il y a un changement d'état de connexion
-      const wasConnected = isConnected.value;
-      isConnected.value = data.device_connected === true;
-
-      // Notifier du changement d'état
-      if (wasConnected !== isConnected.value) {
-        console.log(`⚡ Changement connexion: ${wasConnected ? 'connecté' : 'déconnecté'} -> ${isConnected.value ? 'connecté' : 'déconnecté'}`);
-        connectionLastChanged.value = Date.now();
-        
-        window.dispatchEvent(new CustomEvent('snapclient-connection-changed', {
-          detail: { connected: isConnected.value }
-        }));
-      }
-
-      // Mise à jour des propriétés
-      deviceName.value = data.device_name;
-      host.value = data.host;
-
-      // Mise à jour des serveurs découverts
-      if (data.discovered_servers) {
-        discoveredServers.value = [...data.discovered_servers];
-      }
-
-      // Mise à jour de la blacklist
-      if (data.blacklisted_servers) {
-        blacklistedServers.value = data.blacklisted_servers;
-      }
-
-      // Déduction de l'état du plugin
-      if (!isActive.value) {
+    /**
+     * Réinitialise l'état du store à ses valeurs par défaut.
+     * Typiquement appelé lors du changement de source audio.
+     */
+    function reset() {
+        console.debug("Snapclient store: Réinitialisation de l'état.");
         pluginState.value = 'inactive';
-      } else if (isConnected.value) {
-        pluginState.value = 'connected';
-      } else {
-        pluginState.value = 'ready_to_connect';
-      }
-
-      return data;
-    } catch (err) {
-      console.error('Erreur lors de la récupération du statut Snapclient:', err);
-      error.value = err.message || 'Erreur lors de la récupération du statut';
-
-      // En cas d'erreur réseau, considérer comme déconnecté
-      if (err.response?.status >= 500 || err.code === 'ECONNABORTED' || err.message.includes('Network Error')) {
-        console.warn("Erreur serveur, marquage comme déconnecté");
+        isActive.value = false;
         isConnected.value = false;
-        deviceName.value = null;
-        host.value = null;
-        pluginState.value = 'ready_to_connect';
-        connectionLastChanged.value = Date.now();
-      }
-
-      throw err;
-    } finally {
-      isLoading.value = false;
-    }
-  }
-
-  /**
-   * Déclenche une découverte des serveurs
-   */
-  async function discoverServers() {
-    if (!isActive.value) {
-      return { success: false, inactive: true };
-    }
-
-    try {
-      isLoading.value = true;
-      error.value = null;
-      lastAction.value = 'discover';
-
-      const response = await axios.post('/api/snapclient/discover');
-      const data = response.data;
-
-      if (data.status === 'error') {
-        throw new Error(data.message);
-      }
-
-      // Mise à jour des serveurs découverts
-      if (data.servers) {
-        discoveredServers.value = data.servers;
-      }
-
-      return data;
-    } catch (err) {
-      console.error('Erreur lors de la découverte des serveurs:', err);
-      error.value = err.message || 'Erreur lors de la découverte des serveurs';
-      throw err;
-    } finally {
-      isLoading.value = false;
-    }
-  }
-
-  /**
-   * Se connecte à un serveur Snapcast
-   */
-  async function connectToServer(serverHost) {
-    if (!isActive.value) {
-      return { success: false, inactive: true };
-    }
-
-    // Vérifier si on est déjà connecté à ce serveur
-    if (isConnected.value && host.value === serverHost) {
-      console.log(`🔌 Déjà connecté à ${serverHost}`);
-      return { success: true, already_connected: true };
-    }
-
-    try {
-      isLoading.value = true;
-      error.value = null;
-      lastAction.value = 'connect';
-
-      // Vérifier si le serveur est blacklisté
-      if (blacklistedServers.value.includes(serverHost)) {
-        error.value = `Le serveur ${serverHost} a été déconnecté manuellement. Changez de source audio pour pouvoir vous y reconnecter.`;
-        throw new Error(error.value);
-      }
-
-      // Enregistrer comme dernier serveur utilisé
-      try {
-        localStorage.setItem('lastSnapclientServer', JSON.stringify({
-          host: serverHost,
-          timestamp: Date.now()
-        }));
-      } catch (e) {
-        console.warn("Impossible d'enregistrer le dernier serveur:", e);
-      }
-
-      // Mise à jour optimiste de l'UI
-      isConnected.value = true;
-      pluginState.value = 'connected';
-      host.value = serverHost;
-      connectionLastChanged.value = Date.now();
-
-      // Utiliser le nom du serveur s'il est connu
-      const server = discoveredServers.value.find(s => s.host === serverHost);
-      if (server) {
-        deviceName.value = server.name;
-      } else {
-        deviceName.value = `Serveur (${serverHost})`;
-      }
-
-      // Envoyer la requête de connexion
-      const response = await axios.post(`/api/snapclient/connect/${serverHost}`);
-      const data = response.data;
-
-      if (data.status === 'error') {
-        // Annuler la mise à jour optimiste
-        isConnected.value = false;
-        pluginState.value = 'ready_to_connect';
         host.value = null;
         deviceName.value = null;
-        connectionLastChanged.value = Date.now();
-        throw new Error(data.message);
-      }
-
-      // Mise à jour complète après connexion réussie
-      await fetchStatus(true);
-
-      return data;
-    } catch (err) {
-      console.error(`Erreur lors de la connexion au serveur ${serverHost}:`, err);
-      error.value = error.value || err.message || `Erreur lors de la connexion au serveur ${serverHost}`;
-
-      // Annuler la mise à jour optimiste
-      isConnected.value = false;
-      pluginState.value = 'ready_to_connect';
-      host.value = null;
-      deviceName.value = null;
-      connectionLastChanged.value = Date.now();
-
-      throw err;
-    } finally {
-      isLoading.value = false;
+        discoveredServers.value = [];
+        processRunning.value = false;
+        isLoading.value = false;
+        error.value = null;
     }
-  }
 
-  /**
-   * Se déconnecte du serveur actuel
-   */
-  async function disconnectFromServer() {
-    try {
-      isLoading.value = true;
-      error.value = null;
-      lastAction.value = 'disconnect';
+    // --- Export ---
+    return {
+        // State properties
+        pluginState,
+        isActive,
+        isConnected,
+        host,
+        deviceName,
+        discoveredServers,
+        processRunning,
+        isLoading,
+        error,
 
-      const response = await axios.post('/api/snapclient/disconnect');
-      const data = response.data;
+        // Getters
+        currentServer,
+        showConnectedState,
+        showWaitingState,
 
-      // Mise à jour de la blacklist
-      if (data.blacklisted) {
-        blacklistedServers.value = data.blacklisted;
-      }
-
-      // Mise à jour immédiate de l'UI
-      isConnected.value = false;
-      deviceName.value = null;
-      host.value = null;
-      pluginState.value = 'ready_to_connect';
-      connectionLastChanged.value = Date.now();
-
-      return data;
-    } catch (err) {
-      console.error('Erreur lors de la déconnexion:', err);
-      error.value = err.message || 'Erreur lors de la déconnexion du serveur';
-
-      // Forcer la déconnexion même en cas d'erreur
-      isConnected.value = false;
-      deviceName.value = null;
-      host.value = null;
-      pluginState.value = 'ready_to_connect';
-      connectionLastChanged.value = Date.now();
-
-      return { status: "forced_disconnect", message: "Déconnexion forcée" };
-    } finally {
-      isLoading.value = false;
-    }
-  }
-
-  /**
-   * Réinitialise l'état du store
-   */
-  function reset() {
-    isActive.value = false;
-    isConnected.value = false;
-    deviceName.value = null;
-    host.value = null;
-    pluginState.value = 'inactive';
-    discoveredServers.value = [];
-    error.value = null;
-    lastAction.value = null;
-    // Ne pas réinitialiser la blacklist
-  }
-
-  return {
-    // État
-    isActive,
-    isConnected,
-    deviceName,
-    host,
-    pluginState,
-    discoveredServers,
-    error,
-    lastAction,
-    isLoading,
-
-    // Getters
-    hasServers,
-    currentServer,
-    blacklistedServers,
-
-    // Actions
-    fetchStatus,
-    discoverServers,
-    connectToServer,
-    disconnectFromServer,
-    reset,
-    updateFromWebSocketEvent,
-    updateFromStateEvent,
-    forceDisconnect
-  };
+        // Actions
+        _updateState, // Exposer pour le listener WebSocket global
+        fetchStatus,
+        discoverServers,
+        connectToServer,
+        disconnectFromServer,
+        reset,
+    };
 });
